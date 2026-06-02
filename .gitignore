@@ -1,0 +1,61 @@
+# =============================================================================
+#  .gitignore — keep secrets, proprietary binaries, and build outputs OUT of git
+# =============================================================================
+
+# ---- secrets & per-deployment config ----------------------------------------
+.env
+*.env
+!.env.example
+.env.*
+!*.env.example
+**/targets.json            # WMI/SQL per-target credentials (never commit)
+*.key
+*.pem
+*.passhash
+
+# ---- local deployment / build helpers (not part of the distribution) ----
+v1.0-release.sh
+v1.0-verify.sh
+
+# ---- proprietary PRTG / Paessler material (NEVER redistribute) ---------------
+#  You supply your own licensed probe installer; its payload is staged locally
+#  as docker/app/ at build time and must not be committed.
+installer/
+extracted/
+app/
+docker/app/
+*_Installer*.exe
+
+# ---- compiled build OUTPUTS (produced by build-artifacts.sh / the image build)
+#  All binaries are build products; the sources (.c/.cs/.def/.patch) are tracked.
+*.exe
+*.dll
+*.msi
+*.so
+*.o
+*.obj
+bin/
+obj/
+
+# ---- runtime / generated -----------------------------------------------------
+probe-data/
+dist/
+*.log
+
+# ---- python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- editor / OS cruft -------------------------------------------------------
+.DS_Store
+._*
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.bak-*
+*.orig-*

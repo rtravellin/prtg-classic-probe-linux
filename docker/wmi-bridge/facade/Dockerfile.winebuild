@@ -1,0 +1,10 @@
+# Build a patched Wine 11.0 wbemdisp.dll (i386 PE) — implements propertyset_get__NewEnum
+# so the probe's WMI property enumeration (`For Each prop In obj.Properties_`) works.
+# See docker/WMI-FACADE.md. Output: /src/wbemdisp.dll
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential flex bison perl pkg-config \
+        wget xz-utils ca-certificates python3 \
+        gcc-mingw-w64-i686 g++-mingw-w64-i686 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build

@@ -1,0 +1,88 @@
+--- msg.c.orig	2026-06-01 13:58:40.474685545 +0000
++++ msg.c	2026-06-01 13:59:07.733098818 +0000
+@@ -1103,6 +1103,71 @@
+     Verify
+ } SignOrVerify;
+ 
++/* Hash a signer's authenticated (signed) attributes for signature verification
++ * the way Windows does: over the attributes in their original, on-the-wire
++ * order.  Microsoft's signtool emits the SignedAttributes SET WITHOUT sorting it
++ * into DER-canonical SET-OF order, and Windows' crypt32 hashes the bytes as they
++ * were received.  The normal CryptEncodeObjectEx(PKCS_ATTRIBUTES) path re-encodes
++ * and sorts the SET, producing a different hash, so verifying signtool-signed
++ * binaries (e.g. Authenticode-signed PE files) failed with TRUST_E_CERT_SIGNATURE.
++ * Encode each attribute individually and emit the SET in the decoded order so the
++ * hash matches the signed bytes. */
++static BOOL CRYPT_HashSignedAttrsInOrder(CSignedMsgData *msg_data, DWORD i)
++{
++    const CRYPT_ATTRIBUTES *attrs = &msg_data->info->rgSignerInfo[i].AuthAttrs;
++    BOOL ret = TRUE;
++    DWORD j, bodyLen = 0, lenBytes = 0;
++    LPBYTE *items;
++    DWORD *sizes;
++    LPBYTE out;
++
++    items = CryptMemAlloc(attrs->cAttr * sizeof(*items));
++    sizes = CryptMemAlloc(attrs->cAttr * sizeof(*sizes));
++    if (!items || !sizes)
++    {
++        CryptMemFree(items);
++        CryptMemFree(sizes);
++        return FALSE;
++    }
++    for (j = 0; j < attrs->cAttr; j++)
++        items[j] = NULL;
++    for (j = 0; ret && j < attrs->cAttr; j++)
++    {
++        ret = CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ATTRIBUTE,
++         &attrs->rgAttr[j], CRYPT_ENCODE_ALLOC_FLAG, NULL, &items[j], &sizes[j]);
++        if (ret)
++            bodyLen += sizes[j];
++    }
++    if (ret)
++    {
++        CRYPT_EncodeLen(bodyLen, NULL, &lenBytes);
++        out = LocalAlloc(0, 1 + lenBytes + bodyLen);
++        if (out)
++        {
++            LPBYTE p = out;
++
++            *p++ = 0x31; /* ASN.1 SET OF, constructed */
++            CRYPT_EncodeLen(bodyLen, p, &lenBytes);
++            p += lenBytes;
++            for (j = 0; j < attrs->cAttr; j++)
++            {
++                memcpy(p, items[j], sizes[j]);
++                p += sizes[j];
++            }
++            ret = CryptHashData(msg_data->signerHandles[i].authAttrHash,
++             out, 1 + lenBytes + bodyLen, 0);
++            LocalFree(out);
++        }
++        else
++            ret = FALSE;
++    }
++    for (j = 0; j < attrs->cAttr; j++)
++        LocalFree(items[j]);
++    CryptMemFree(items);
++    CryptMemFree(sizes);
++    return ret;
++}
++
+ static BOOL CSignedMsgData_UpdateAuthenticatedAttributes(
+  CSignedMsgData *msg_data, SignOrVerify flag)
+ {
+@@ -1131,7 +1196,12 @@
+                     ret = CSignedMsgData_AppendMessageDigestAttribute(msg_data,
+                      i);
+             }
+-            if (ret)
++            if (ret && flag == Verify)
++            {
++                /* hash signed attrs in on-the-wire order (Windows-compatible) */
++                ret = CRYPT_HashSignedAttrsInOrder(msg_data, i);
++            }
++            else if (ret)
+             {
+                 LPBYTE encodedAttrs;
+                 DWORD size;

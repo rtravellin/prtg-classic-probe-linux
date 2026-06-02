@@ -1,0 +1,261 @@
+# =============================================================================
+#  PRTG Classic Probe on Linux — distributable production stack
+# =============================================================================
+#  Copy .env.example to .env and fill in YOUR values, then:  docker compose up -d
+#
+#  Services:
+#    prtg-probe   the PRTG classic remote probe under Wine 11. Connects OUT to your
+#                 PRTG core and runs every sensor class that works off-Windows:
+#                 HTTP/Ping/SNMP, the v2/"Momo" modules, native WMI, the .NET
+#                 "Engine C" helpers (VMware/SQL/…), PowerShell sensors, packet sniffer.
+#    wmi-sidecar  two Python bridges the probe dials on loopback for the protocols
+#                 Wine can't do itself:
+#                   :8910  Impacket  — remote WMI over DCOM
+#                   :8911  pypsrp    — PowerShell remoting (PSRP/WSMan)
+#                 Both gated by a shared secret (BRIDGE_TOKEN) when set.
+#    prtg-admin   web admin panel (replaces PRTG Administrator.exe). HTTP on :8080.
+#    prtg-updater watchdog that rebuilds/redeploys the probe when the core pushes an
+#                 update. Control API bound to 127.0.0.1:8099 (admin panel drives it).
+#    snmp-test    OPTIONAL SNMP responder for validation (profile "test", off by default).
+#
+#  Everything runs on the HOST network namespace: the probe reaches the core on
+#  ${CORE_PORT}/tcp and its targets on native ports; the sidecars are reachable by
+#  the probe on 127.0.0.1:8910/8911 AND can dial DCOM/WSMan on the LAN; the sniffer
+#  sees the host NICs. See docker/SECURITY.md for the full network/trust model and
+#  docker/QUICKSTART.md for first-run setup.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  The probe itself.
+  # ---------------------------------------------------------------------------
+  prtg-probe:
+    image: prtg-probe:${PROBE_TAG:-1.0}
+    # To build instead of using a pre-built image, uncomment:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.prod
+    #   platforms: ["linux/amd64"]
+    container_name: prtg-probe
+    restart: unless-stopped
+
+    # Host networking: out to the core, out to monitored targets, in to the
+    # sidecars on loopback, and direct visibility of the host NICs for the sniffer.
+    network_mode: host
+
+    # Start as root so the entrypoint can drop to the prtg user (uid 1000) WITH
+    # CAP_NET_RAW/CAP_NET_ADMIN in the AMBIENT set — the only way a non-root process
+    # keeps the caps the packet sniffer needs. Safe without the caps too: the
+    # entrypoint drops to prtg and only the sniffer is unavailable. See docker/SECURITY.md.
+    user: "0:0"
+    cap_add:
+      - NET_RAW      # libpcap capture (packet sniffer) + Wine ICMP "ping" sockets
+      - NET_ADMIN    # promiscuous mode for SPAN/mirror capture
+
+    # Pin the core hostname → IP (the core's cert CN is the FQDN). Required unless the
+    # Docker host's DNS already resolves CORE_SERVER. Fill CORE_SERVER + CORE_IP in .env.
+    extra_hosts:
+      - "${CORE_SERVER}:${CORE_IP}"
+
+    environment:
+      # --- core connection (from .env) ---
+      CORE_SERVER: ${CORE_SERVER}
+      CORE_PORT: ${CORE_PORT:-23560}
+      # --- probe identity / auth (from .env) ---
+      PROBE_KEY: ${PROBE_KEY}
+      PROBE_NAME: ${PROBE_NAME:-Linux-Probe}
+      # Reuse an already-approved GId to reconnect straight to "Up"; leave empty in
+      # .env for a brand-new probe (approve it once in the PRTG UI).
+      PROBE_GID: ${PROBE_GID:-}
+      # --- sidecar shared secret (from .env) ---
+      WMI_FACADE_TOKEN: ${BRIDGE_TOKEN:-}
+      PSRP_BRIDGE_TOKEN: ${BRIDGE_TOKEN:-}
+      # --- runtime ---
+      MODE: services
+      # DEBUG_LOG: "1"   # uncomment for verbose probe/connection logging
+      # Probe updates are handled by the prtg-updater sidecar (managed rebuild +
+      # redeploy). See docker/AUTO-UPDATE.md.
+
+    # Persist the probe's data tree (logs, monitoring-module state, sensor cache).
+    # Identity also lives in the Wine registry, re-seeded from env on every boot.
+    # Program Files is NOT persisted: it is baked into the image (the Inno installer
+    # runs under Wine at build time), so an updater rebuild always ships a clean
+    # payload — there is no Program Files volume to shadow it.
+    volumes:
+      - prtg-probe-data:/home/prtg/.wine/drive_c/ProgramData/Paessler/PRTG Network Monitor
+      - ./probe-data/sql-bridge:/opt/sql-bridge                  # SQL v2 bridge: per-target DB creds (targets.json) — see DOTNET-ENGINE-C.md
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 5
+
+    depends_on:
+      - wmi-sidecar
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # ---------------------------------------------------------------------------
+  #  WMI + PSRP sidecars (one container, both bridges).
+  # ---------------------------------------------------------------------------
+  wmi-sidecar:
+    image: wmi-bridge:${SIDECAR_TAG:-1.0}
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.sidecar
+    #   platforms: ["linux/amd64"]
+    container_name: wmi-sidecar
+    restart: unless-stopped
+    network_mode: host
+
+    # Per-target WMI credentials, mode 600 (optional — creds can also come per-request
+    # from PRTG, or from WMI_USER/WMI_PASS below as a single default).
+    #   /opt/wmi-bridge/targets.json  e.g.  { "192.0.2.50": {"user":"…","password":"…","domain":"."} }
+    volumes:
+      - ${WMI_TARGETS_DIR:-/opt/wmi-bridge}:/etc/wmi-bridge:ro
+
+    environment:
+      WMI_BRIDGE_ADDR: 127.0.0.1
+      WMI_BRIDGE_PORT: "8910"
+      WMI_BRIDGE_CONFIG: /etc/wmi-bridge/targets.json
+      PSRP_BRIDGE_ADDR: 127.0.0.1
+      PSRP_BRIDGE_PORT: "8911"
+      # Shared secret — when set, both bridges require X-Bridge-Token. The probe sends
+      # the same value (WMI_FACADE_TOKEN / PSRP_BRIDGE_TOKEN). Empty = open (loopback only).
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN:-}
+      # Single default WMI credential (fallback when not in targets.json / per-request).
+      WMI_USER: ${WMI_USER:-}
+      WMI_PASS: ${WMI_PASS:-}
+      WMI_DOMAIN: ${WMI_DOMAIN:-}
+      # PSRP TLS: validate target certs by default; PSRP_INSECURE_TLS=1 opts out (self-signed).
+      PSRP_CERT_VALIDATION: ${PSRP_CERT_VALIDATION:-1}
+      PSRP_INSECURE_TLS: ${PSRP_INSECURE_TLS:-0}
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0 if all(socket.socket().connect_ex(('127.0.0.1',p))==0 for p in (8910,8911)) else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ---------------------------------------------------------------------------
+  #  OPTIONAL SNMP responder for validating SNMP sensors (profile "test").
+  #    docker compose --profile test up -d snmp-test
+  # ---------------------------------------------------------------------------
+  snmp-test:
+    image: polinux/snmpd
+    container_name: snmp-test
+    restart: unless-stopped
+    network_mode: host
+    profiles: ["test"]
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  # ---------------------------------------------------------------------------
+  #  Admin panel — web replacement for PRTG Administrator.exe. UI on :8080 (HTTP Basic).
+  #  If ADMIN_PASS is empty, a random password is generated and printed to the
+  #  container log on first boot:  docker compose logs prtg-admin | grep -A4 password
+  # ---------------------------------------------------------------------------
+  prtg-admin:
+    image: prtg-admin:${ADMIN_TAG:-1.0}
+    # build:
+    #   context: ./admin-panel
+    #   dockerfile: Dockerfile
+    #   platforms: ["linux/amd64"]
+    container_name: prtg-admin
+    restart: unless-stopped
+    network_mode: host                 # reach :8910/:8911 on loopback; publish :8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # introspect + control the probe
+    environment:
+      PANEL_PORT: "8080"
+      PROBE_CONTAINER: prtg-probe
+      PROBE_USER: prtg
+      SIDECAR_CONTAINER: wmi-sidecar
+      WINEPREFIX: /home/prtg/.wine
+      CORE_PORT: ${CORE_PORT:-23560}
+      WMI_HEALTH_URL: "http://127.0.0.1:8910/health"
+      PSRP_HEALTH_URL: "http://127.0.0.1:8911/health"
+      UPDATER_URL: "http://127.0.0.1:8099"
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:-}       # empty → random password generated + logged on first boot
+      READ_ONLY: ${READ_ONLY:-0}        # "1" disables all write/control actions
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - prtg-probe
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  # ---------------------------------------------------------------------------
+  #  Auto-update watchdog — closes the loop on PRTG's probe auto-update.
+  #  Control API bound to 127.0.0.1:8099 (UPDATER_BIND). Only accepts an installer
+  #  that carries a valid Paessler Authenticode signature. See docker/AUTO-UPDATE.md.
+  #
+  #  REQUIRES the build context on the host (build-probe.py, Dockerfile.prod, patch
+  #  artifacts, …) mounted at /context — set BUILD_CONTEXT_DIR in .env. COMPOSE_PROJECT_NAME
+  #  MUST match the name this stack was brought up with so recreate hits the same probe.
+  # ---------------------------------------------------------------------------
+  prtg-updater:
+    image: prtg-updater:${UPDATER_TAG:-1.0}
+    # build:
+    #   context: ./updater
+    #   dockerfile: Dockerfile
+    container_name: prtg-updater
+    restart: unless-stopped
+    network_mode: host                 # reach :8099 on loopback; run compose against this stack
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock        # build images + recreate the probe
+      - ${BUILD_CONTEXT_DIR:-./}:/context                # build-probe.py + Dockerfile.prod + artifacts
+      - ${DEPLOY_DIR:-./}:/deploy                         # dir holding THIS compose file + .env
+      - prtg-probe-data:/probe-data:ro                   # watch …/download for the pushed installer
+      - prtg-updater-state:/state                        # state.json + build logs (served to the panel)
+      - prtg-updater-drop:/dropzone                      # drop an installer .exe here for a manual build
+    environment:
+      PROBE_CONTAINER: prtg-probe
+      BUILD_CONTEXT: /context
+      BUILD_PROBE: /context/build-probe.py
+      PROBE_DATA: /probe-data
+      DEPLOY_DIR: /deploy
+      COMPOSE_FILE: /deploy/docker-compose.yml
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-prtg}   # MUST match the running stack's project
+      STATE_DIR: /state
+      DROPZONE: /dropzone
+      CORE_PORT: ${CORE_PORT:-23560}
+      POLL_INTERVAL: "10"
+      AUTO_APPLY: ${AUTO_APPLY:-0}      # "1" = recreate automatically after a successful build
+      DOCKER_BUILD_CMD: docker
+      UPDATER_PORT: "8099"
+      UPDATER_BIND: ${UPDATER_BIND:-127.0.0.1}
+      VERIFY_AUTHENTICODE: ${VERIFY_AUTHENTICODE:-1}
+      REQUIRE_AUTHENTICODE: ${REQUIRE_AUTHENTICODE:-0}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+volumes:
+  prtg-probe-data:
+    name: prtg-probe-data
+  prtg-updater-state:
+    name: prtg-updater-state
+  prtg-updater-drop:
+    name: prtg-updater-drop

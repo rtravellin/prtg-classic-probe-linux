@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRTG Probe Builder</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#3fb950; --accent2:#58a6ff;
+    --warn:#d29922; --err:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{padding:18px 26px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{margin:0;font-size:18px;font-weight:600}
+  header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  .wrap{max-width:980px;margin:0 auto;padding:24px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+        padding:20px;margin-bottom:20px}
+  .card h2{margin:0 0 14px;font-size:14px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+  #drop{border:2px dashed var(--border);border-radius:10px;padding:36px;text-align:center;
+        cursor:pointer;transition:.15s;background:var(--panel2)}
+  #drop.hover{border-color:var(--accent2);background:#1b2a3a}
+  #drop .big{font-size:15px;font-weight:600}
+  #drop .sub{color:var(--muted);font-size:13px;margin-top:6px}
+  #fileinfo{margin-top:12px;font-family:var(--mono);font-size:13px;color:var(--accent)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  input[type=text]{width:100%;background:var(--bg);border:1px solid var(--border);
+        color:var(--fg);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:13px}
+  input::placeholder{color:#586069}
+  .opts{display:flex;flex-wrap:wrap;gap:16px;margin-top:14px}
+  .opts label{display:flex;align-items:center;gap:6px;color:var(--fg);font-size:13px;margin:0}
+  .row{margin-top:16px;display:flex;gap:12px;align-items:center}
+  button{background:var(--accent);color:#03210c;border:0;border-radius:6px;
+        padding:10px 22px;font-weight:600;font-size:14px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--accent2);border:1px solid var(--border)}
+  pre#log{background:#010409;border:1px solid var(--border);border-radius:8px;
+        padding:14px;max-height:440px;overflow:auto;font-family:var(--mono);font-size:12.5px;
+        white-space:pre-wrap;color:#c9d1d9;margin:0}
+  pre#log .ok{color:var(--accent)} pre#log .warn{color:var(--warn)}
+  pre#log .err{color:var(--err)} pre#log .step{color:var(--accent2);font-weight:600}
+  .hidden{display:none}
+  .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;
+        background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
+  .status{font-weight:600}
+  a.dl{display:inline-block;margin-top:8px}
+  small.note{color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>PRTG Classic Probe on Linux — Builder</h1>
+  <p>Drop a remote-probe installer; get a ready-to-deploy Docker package. Context: <span class="badge">{{ context }}</span></p>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>1 · Installer</h2>
+    <div id="drop">
+      <div class="big">Drag &amp; drop the installer .exe here</div>
+      <div class="sub">or click to browse — max {{ max_mb }} MB</div>
+      <input id="file" type="file" accept=".exe" class="hidden">
+    </div>
+    <div id="fileinfo"></div>
+  </div>
+
+  <div class="card">
+    <h2>2 · Configuration <small class="note">— blanks are auto-detected from the filename / payload</small></h2>
+    <div class="grid">
+      <div><label>Core server (FQDN)</label><input id="core_server" type="text" placeholder="auto from filename"></div>
+      <div><label>Core IP (extra_hosts)</label><input id="core_ip" type="text" placeholder="auto: DNS resolve"></div>
+      <div><label>Core port</label><input id="core_port" type="text" placeholder="23560"></div>
+      <div><label>Access key (8 hex)</label><input id="probe_key" type="text" placeholder="auto from filename"></div>
+      <div><label>Probe name</label><input id="probe_name" type="text" placeholder="Linux-Docker-Probe"></div>
+      <div><label>Probe GId</label><input id="probe_gid" type="text" placeholder="(blank = new identity)"></div>
+      <div><label>Image tag</label><input id="tag" type="text" placeholder="1.0"></div>
+    </div>
+    <div class="opts">
+      <label><input id="no_build" type="checkbox"> config only (no docker build)</label>
+      <label><input id="skip_sidecar" type="checkbox"> skip sidecar image</label>
+      <label><input id="skip_admin" type="checkbox"> skip admin image</label>
+      <label><input id="smoke_test" type="checkbox"> smoke-test after build</label>
+    </div>
+    <div class="row">
+      <button id="go">Build package</button>
+      <span id="status" class="status"></span>
+    </div>
+  </div>
+
+  <div class="card hidden" id="logcard">
+    <h2>3 · Build log</h2>
+    <pre id="log"></pre>
+    <div id="result"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let chosenFile = null;
+
+const drop = $('drop'), file = $('file');
+drop.onclick = () => file.click();
+['dragover','dragenter'].forEach(e => drop.addEventListener(e, ev => {ev.preventDefault();drop.classList.add('hover')}));
+['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => {ev.preventDefault();drop.classList.remove('hover')}));
+drop.addEventListener('drop', ev => { if(ev.dataTransfer.files.length) setFile(ev.dataTransfer.files[0]); });
+file.onchange = () => { if(file.files.length) setFile(file.files[0]); };
+
+async function setFile(f){
+  chosenFile = f;
+  $('fileinfo').textContent = `✓ ${f.name}  (${(f.size/1048576).toFixed(1)} MB)`;
+  try{
+    const r = await fetch('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({filename:f.name})});
+    const p = await r.json();
+    if(p.server && !$('core_server').value) $('core_server').value = p.server;
+    if(p.key && !$('probe_key').value) $('probe_key').value = p.key;
+    if(p.gid && !$('probe_gid').value) $('probe_gid').value = p.gid;
+    if(p.port && !$('core_port').value) $('core_port').value = p.port;
+  }catch(e){}
+}
+
+const COLOR = line => {
+  const cls = /✓|BUILD COMPLETE|OK\b/.test(line) ? 'ok'
+            : /^\s*!|WARN/.test(line) ? 'warn'
+            : /FATAL|failed|Error/i.test(line) ? 'err'
+            : /^==>/.test(line) ? 'step' : '';
+  const span = document.createElement('span');
+  if(cls) span.className = cls;
+  span.textContent = line + '\n';
+  return span;
+};
+
+$('go').onclick = async () => {
+  if(!chosenFile){ alert('Choose an installer .exe.'); return; }
+  $('go').disabled = true; $('status').textContent = 'uploading…';
+  $('logcard').classList.remove('hidden'); $('log').textContent=''; $('result').textContent='';
+
+  const fd = new FormData();
+  if(chosenFile) fd.append('installer', chosenFile);
+  ['core_server','core_ip','core_port','probe_key','probe_name','probe_gid','tag']
+    .forEach(k => { const v=$(k).value.trim(); if(v) fd.append(k,v); });
+  ['no_build','skip_sidecar','skip_admin','smoke_test']
+    .forEach(k => { if($(k).checked) fd.append(k,'1'); });
+
+  let job;
+  try{
+    const r = await fetch('/api/build',{method:'POST',body:fd});
+    job = await r.json();
+    if(job.error){ throw new Error(job.error); }
+  }catch(e){ $('status').textContent='error'; $('log').appendChild(COLOR('FATAL: '+e.message)); $('go').disabled=false; return; }
+
+  $('status').textContent = 'building… (job '+job.job_id+')';
+  $('log').appendChild(COLOR('$ '+job.cmd));
+  const es = new EventSource('/api/stream/'+job.job_id);
+  const logEl = $('log');
+  es.onmessage = ev => { logEl.appendChild(COLOR(ev.data)); logEl.scrollTop = logEl.scrollHeight; };
+  es.addEventListener('done', ev => {
+    es.close(); $('go').disabled=false;
+    const rc = (ev.data.match(/rc=(-?\d+)/)||[])[1];
+    if(rc === '0'){
+      $('status').textContent = 'done ✓';
+      $('result').innerHTML = `<a class="dl" href="/api/download/${job.job_id}">⬇ Download package (.tar.gz)</a>
+        <div><small class="note">Then: <code>tar xzf … &amp;&amp; cd prtg-classic-probe-linux-package &amp;&amp; docker compose up -d</code></small></div>`;
+    }else{
+      $('status').textContent = 'failed (rc='+rc+')';
+    }
+  });
+};
+</script>
+</body>
+</html>

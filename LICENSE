@@ -1,0 +1,43 @@
+MIT License
+
+Copyright (c) 2026 PRTG Classic Probe on Linux contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Scope of this license
+================================================================================
+
+This MIT license covers ONLY the original work in this repository:
+
+  * the shell/Python scripts (scripts/, build-probe.py, sidecars, …)
+  * the WMI / PSRP sidecars and the wbemfacade / wbemdisp / Mono shim sources
+  * the Flask + JavaScript admin panel (admin-panel/)
+  * the auto-update watchdog and the PRTGProbeUpdate interception shim
+  * the Dockerfiles, compose files, and documentation
+
+It does NOT cover PRTG Network Monitor, "PRTG Probe.exe", the monitoring
+modules, or any other Paessler AG software. Those are the proprietary property
+of Paessler AG and are NOT distributed with this project. To run this probe you
+must supply your own PRTG probe installer and hold a valid PRTG license that
+permits its use.
+
+PRTG and PRTG Network Monitor are registered trademarks of Paessler AG. This
+project is independent and is not affiliated with, endorsed by, sponsored by,
+or supported by Paessler AG.

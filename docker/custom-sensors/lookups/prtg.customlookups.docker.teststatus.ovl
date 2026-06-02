@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValueLookup id="prtg.customlookups.docker.teststatus" desiredValue="1" undefinedState="Warning" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="PaeValueLookup.xsd">
+  <Lookups>
+    <SingleInt state="Warning" value="0">Docker-Lookup-WARN</SingleInt>
+    <SingleInt state="Ok"      value="1">Docker-Lookup-OK</SingleInt>
+    <SingleInt state="Error"   value="2">Docker-Lookup-ERROR</SingleInt>
+  </Lookups>
+</ValueLookup>

@@ -1,0 +1,14 @@
+{
+  "__comment": "Per-target DB credentials for the SQL v2 bridge (EXEXML/sql-v2.bat -> /opt/runsql.sh). Provide the REAL file at runtime as /opt/sql-bridge/targets.json (e.g. a Docker volume/bind mount); it is NOT baked into the image. The EXE/Script Advanced sensor's 'exeparams' is the key. 'sqlfile' is a file in Custom Sensors\\sql\\<flavor>\\ (flavor derived from 'server'). Auth is SQL auth (dbauth=1).",
+  "pgtest": {
+    "server": "PostgreSQL",
+    "host": "192.0.2.10",
+    "port": "5432",
+    "database": "appdb",
+    "dbuser": "appuser",
+    "dbpass": "CHANGEME",
+    "sslmode": "Prefer",
+    "sqlfile": "docker-test.sql",
+    "channel": "Answer"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "prtg": {
+    "description": {
+      "comment": "Classic probe REST Custom test - parses GitHub repo JSON into 4 channels via JSONPath"
+    },
+    "result": [
+      { "channel": "Stars",       "value": $.stargazers_count },
+      { "channel": "Forks",       "value": $.forks_count },
+      { "channel": "Open Issues", "value": $.open_issues_count },
+      { "channel": "Size KB",     "value": $.size, "unit": "KByte" }
+    ],
+    "text": $.full_name
+  }
+}

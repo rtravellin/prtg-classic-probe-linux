@@ -1,0 +1,57 @@
+# =============================================================================
+#  Admin-panel service — paste into docker/docker-compose.yml under `services:`
+#  (it is already wired to the prtg-probe / wmi-sidecar stack on that host).
+# =============================================================================
+#
+#  Why these mounts/flags:
+#    * /var/run/docker.sock  the panel reads & controls the probe via the Docker
+#                            API (docker exec/inspect/restart). This is privileged
+#                            — it is the panel's whole job, the same authority the
+#                            Windows PRTG Administrator had over the service.
+#    * network_mode: host    so the panel can reach the probe's loopback sidecar
+#                            health endpoints (127.0.0.1:8910 WMI, :8911 PSRP) and
+#                            so PANEL_PORT is published directly on the host.
+#    * ADMIN_USER/PASS       HTTP Basic auth. CHANGE THESE.
+#
+#  Then:  docker compose up -d prtg-admin   →   http://<host>:8080
+# =============================================================================
+
+  prtg-admin:
+    image: prtg-admin:1.0
+    # build:
+    #   context: ./admin-panel
+    #   dockerfile: Dockerfile
+    container_name: prtg-admin
+    restart: unless-stopped
+    network_mode: host          # reach :8910/:8911 on loopback; publish :8080 on host
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # introspect + control the probe
+
+    environment:
+      PANEL_PORT: "8080"                 # change to re-map the UI port
+      PROBE_CONTAINER: prtg-probe        # the probe container to manage
+      PROBE_USER: prtg                   # user the probe runs as inside that container
+      SIDECAR_CONTAINER: wmi-sidecar     # for reading masked WMI targets.json
+      WINEPREFIX: /home/prtg/.wine
+      CORE_PORT: "23560"
+      WMI_HEALTH_URL: "http://127.0.0.1:8910/health"
+      PSRP_HEALTH_URL: "http://127.0.0.1:8911/health"
+      ADMIN_USER: "admin"
+      # Leave empty → a strong random password is generated and printed to the
+      # container log on first boot. Set a value to pin it. Never hard-code one here.
+      ADMIN_PASS: ""
+      # READ_ONLY: "1"                   # uncomment to disable all write/control actions
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    depends_on:
+      - prtg-probe
+
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }

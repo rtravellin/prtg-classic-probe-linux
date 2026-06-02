@@ -1,0 +1,7 @@
+# Throwaway MinGW builder for wbemfacade.dll (win32 / i686).
+# Produces /out/wbemfacade.dll. See docker/WMI-FACADE.md.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-mingw-w64-i686 binutils-mingw-w64-i686 mingw-w64-i686-dev make \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PRTG Probe Admin</title>
+  <link rel="preconnect" href="/static">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%2300b050'/></svg>">
+</head>
+<body>
+  <div id="app">
+    <!-- ─── Sidebar ─────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo"></span>
+        <div>
+          <div class="brand-title">PRTG Classic Probe</div>
+          <div class="brand-sub">Linux · Wine · Docker</div>
+        </div>
+      </div>
+      <nav>
+        <a data-view="dashboard" class="nav-item active"><i class="ic">▦</i>Dashboard</a>
+        <a data-view="config"    class="nav-item"><i class="ic">⚙</i>Configuration</a>
+        <a data-view="service"   class="nav-item"><i class="ic">⏻</i>Service</a>
+        <a data-view="logs"      class="nav-item"><i class="ic">≣</i>Logs</a>
+        <a data-view="health"    class="nav-item"><i class="ic">♥</i>Health</a>
+        <a data-view="updates"   class="nav-item"><i class="ic">⤓</i>Updates</a>
+      </nav>
+      <div class="side-foot">
+        <div id="conn-pill" class="pill pill-grey">● checking…</div>
+        <div class="side-meta" id="side-meta"></div>
+      </div>
+    </aside>
+
+    <!-- ─── Main ────────────────────────────────────────────── -->
+    <main class="main">
+      <header class="topbar">
+        <h1 id="view-title">Dashboard</h1>
+        <div class="topbar-right">
+          <span id="refresh-note" class="muted"></span>
+          <button id="refresh-btn" class="btn btn-ghost" title="Refresh">⟳</button>
+        </div>
+      </header>
+
+      <div id="toast" class="toast"></div>
+
+      <!-- Dashboard -->
+      <section data-panel="dashboard" class="panel active">
+        <div class="grid cards" id="dash-cards"></div>
+        <div class="row2">
+          <div class="card">
+            <div class="card-h">Monitoring modules</div>
+            <div id="dash-modules" class="card-b"></div>
+          </div>
+          <div class="card">
+            <div class="card-h">Connection</div>
+            <div id="dash-conn" class="card-b"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Configuration -->
+      <section data-panel="config" class="panel">
+        <div class="card">
+          <div class="card-h">Core connection &amp; identity</div>
+          <div class="card-b">
+            <div class="banner" id="cfg-banner">Changes write to the Wine registry. The
+              container entrypoint re-asserts <b>core server / port / access key</b> from
+              compose env on every boot — to persist those permanently, also update the
+              compose file. A probe restart applies changes.</div>
+            <form id="cfg-form" class="form">
+              <label>Core server <input name="core_server" autocomplete="off"></label>
+              <label>Core port <input name="core_port" autocomplete="off"></label>
+              <label>Probe name <input name="probe_name" autocomplete="off"></label>
+              <label>GID <input name="gid" disabled></label>
+              <label>Data directory <input name="data_path" disabled></label>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Save config</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="row2">
+          <div class="card">
+            <div class="card-h">Access key</div>
+            <div class="card-b">
+              <p class="muted">8 hex characters. Must match the key set in the core
+                (Setup ▸ Probes).</p>
+              <form id="key-form" class="form">
+                <label>Access key
+                  <input name="key" maxlength="8" pattern="[0-9A-Fa-f]{8}"
+                         placeholder="DEADBEEF" autocomplete="off"></label>
+                <div class="form-actions">
+                  <button type="submit" class="btn btn-warn">Rotate key</button>
+                </div>
+              </form>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h">Logging level</div>
+            <div class="card-b">
+              <p class="muted">Verbose debug logging for the probe process.</p>
+              <div class="seg" id="loglevel-seg">
+                <button data-level="normal" class="seg-btn">Normal</button>
+                <button data-level="debug"  class="seg-btn">Debug</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h">WMI sidecar targets</div>
+          <div class="card-b">
+            <p class="muted">Per-target credentials the Impacket bridge uses
+              (read-only here; passwords masked). Edit
+              <code>/opt/wmi-bridge/targets.json</code> on the host.</p>
+            <table class="tbl" id="wmi-tbl"><thead>
+              <tr><th>Target</th><th>Username</th><th>Domain</th><th>Password</th></tr>
+            </thead><tbody></tbody></table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Service -->
+      <section data-panel="service" class="panel">
+        <div class="grid cards" id="svc-cards"></div>
+        <div class="card">
+          <div class="card-h">Service control</div>
+          <div class="card-b">
+            <div class="btn-row">
+              <button class="btn btn-primary" data-act="start">▶ Start probe</button>
+              <button class="btn btn-warn"    data-act="stop">■ Stop probe</button>
+              <button class="btn btn-warn"    data-act="restart">⟲ Restart probe</button>
+              <button class="btn btn-danger"  data-act="restart-container">⟳ Restart container</button>
+            </div>
+            <p class="muted">Start/stop drive Wine's SCM
+              (<code>net start/stop PRTGProbeService</code>). “Restart container”
+              recreates the whole probe via the Docker API.</p>
+            <pre id="svc-output" class="output" hidden></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section data-panel="logs" class="panel">
+        <div class="card">
+          <div class="log-toolbar">
+            <div class="seg" id="log-file-seg">
+              <button data-log="Probe.log" class="seg-btn active">Probe.log</button>
+              <button data-log="Sniffer.log" class="seg-btn">Sniffer.log</button>
+              <button data-log="ProbeWMI.log" class="seg-btn">ProbeWMI.log</button>
+              <button data-log="ProbeSnmpWrapper.log" class="seg-btn">SnmpWrapper.log</button>
+            </div>
+            <div class="log-controls">
+              <select id="log-level">
+                <option value="">All levels</option>
+                <option>NOTI</option><option>INFO</option><option>WARN</option>
+                <option>ALRT</option><option>ERRO</option><option>DEBG</option>
+              </select>
+              <select id="log-lines">
+                <option value="100">100 lines</option>
+                <option value="200" selected>200 lines</option>
+                <option value="500">500 lines</option>
+                <option value="1000">1000 lines</option>
+              </select>
+              <label class="chk"><input type="checkbox" id="log-follow" checked> Live</label>
+            </div>
+          </div>
+          <pre id="log-view" class="logview">loading…</pre>
+        </div>
+      </section>
+
+      <!-- Health -->
+      <section data-panel="health" class="panel">
+        <div class="grid health" id="health-grid"></div>
+      </section>
+
+      <!-- Updates -->
+      <section data-panel="updates" class="panel">
+        <div class="grid cards" id="upd-cards"></div>
+        <div class="card">
+          <div class="card-h">Update orchestration</div>
+          <div class="card-b">
+            <div class="banner" id="upd-banner">When the PRTG core pushes a probe
+              update, the new installer is intercepted, fed through
+              <code>build-probe.py</code>, and a fresh image is built. Apply swaps the
+              container to it — the data volume &amp; probe identity carry over.</div>
+            <div id="upd-pending"></div>
+            <div class="btn-row" id="upd-actions">
+              <button class="btn btn-primary" data-uact="apply" id="upd-apply" disabled>⬆ Apply pending update</button>
+              <button class="btn btn-ghost"   data-uact="scan">⟳ Scan for installer</button>
+              <button class="btn btn-warn"     data-uact="rollback" id="upd-rollback" disabled>↩ Roll back</button>
+            </div>
+            <p class="muted" id="upd-msg"></p>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="card">
+            <div class="card-h">Build log</div>
+            <div class="card-b"><pre id="upd-log" class="logview" style="max-height:320px">—</pre></div>
+          </div>
+          <div class="card">
+            <div class="card-h">Activity</div>
+            <div class="card-b"><div id="upd-history"></div></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

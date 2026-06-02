@@ -1,0 +1,471 @@
+# =============================================================================
+#  PRTG Classic Remote Probe under Wine  —  PRODUCTION image
+# =============================================================================
+#  Cold `docker run` → a probe that connects to prtg.example.com and logs in, ZERO manual
+#  steps. The runtime fixes required to run the probe under Wine are baked in
+#  below; the root causes and where each is handled:
+#
+#   1. ServerPort as REG_DWORD → the probe crashes (c0000005) ~3s after "Start Done".
+#      FIX: scripts write ServerPort/DefaultPort as REG_SZ and re-assert before
+#      every start (the probe rewrites its own config to DWORD across runs).
+#                                               → scripts/run-probe.sh reassert_config()
+#   2. Access-key FORMAT. The key is HKLM\…\Probe\Password = REG_DWORD 0x<key>,
+#      NOT the accesskeys/AppServerAccessKey REG_SZ strings (those are ignored →
+#      "#3:Access key incorrect!").             → seed-registry.sh / reassert_config()
+#   3. Service registration ORDER. PRTGProbeService must exist in the registry
+#      BEFORE `wineboot --init`, or Wine's services.exe never enumerates it and
+#      `net start` fails with "Could not get handle to service".
+#                                               → run-probe.sh registers, THEN boots
+#   4. Cold-prefix session teardown. Wine tears services.exe (and the probe)
+#      down when nothing holds the prefix open (autostart services fail with
+#      1115 ERROR_SHUTDOWN_IN_PROGRESS). FIX: wineserver -p + a long-lived anchor
+#      process for the life of the container.   → run-probe.sh keep_session_alive()
+#
+#  Build:
+#    docker build --platform linux/amd64 -f Dockerfile.prod -t prtg-probe:1.0 .
+#
+#  Run (cold, persistent state in a named volume):
+#    docker run -d --name prtg-probe \
+#      --network host --restart unless-stopped \
+#      --dns 192.0.2.1 --add-host prtg.example.com:203.0.113.10 \
+#      -v prtg-probe-data:"/home/prtg/.wine/drive_c/ProgramData/Paessler/PRTG Network Monitor" \
+#      prtg-probe:1.0
+#
+#  ICMP / Ping sensors: Wine does ICMP via unprivileged datagram
+#  ("ping") sockets, so the non-root probe needs the host's ping_group_range to
+#  include its gid, else Ping sensors fail with "ICMP error # 5" (access denied):
+#    --network host : set on the host once  →  sysctl -w net.ipv4.ping_group_range="0 2147483647"
+#    --network bridge: add  --sysctl net.ipv4.ping_group_range="0 2147483647"
+#  HTTP and classic SNMP sensors work without this.
+#
+#  Probe identity (server, port, access key and GId) is supplied at runtime via
+#  environment variables — no GId is baked into the image.
+#  For a NEW probe identity: leave -e PROBE_GID="" and approve it once in the
+#  PRTG UI, then pin that GId thereafter.
+# =============================================================================
+# Base pinned to the bookworm-slim line; for byte-reproducible builds append the
+# digest your registry resolves, e.g. debian:bookworm-slim@sha256:<digest>.
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---- 1. enable i386 multiarch + runtime tooling ----------------------------
+#  The probe is a 32-bit x86 Delphi binary, so the host needs i386 multiarch and
+#  a 32-bit-capable Wine. net-tools/iputils/dnsutils back the healthcheck and
+#  in-container diagnostics; gosu is used to drop to the prtg user.
+RUN dpkg --add-architecture i386 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates wget gnupg2 \
+        xvfb x11-utils \
+        winbind \
+        cabextract \
+        procps psmisc lsof \
+        binutils \
+        net-tools iputils-ping dnsutils \
+        libgdiplus:i386 \
+        gosu \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- 2. WineHQ stable (11.0) repo + install --------------------------------
+#  Stable 11.0; the lifecycle behaviour is Wine-version-independent, and the
+#  stable channel is used in production.
+#  IMPORTANT: the patched builtin crypt32.dll / kernelbase.dll / wbemdisp.dll
+#  (steps 5b/5c) are built against Wine 11.0, so the package is PINNED to 11.0 below.
+#  If you move to a newer Wine, bump WINE_VERSION here AND rebuild the patched
+#  artifacts for that version (see docker/build-artifacts.sh), or the patched
+#  builtins may not match.
+ARG WINE_VERSION=11.0.0.0~bookworm-1
+RUN mkdir -pm755 /etc/apt/keyrings \
+ && wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key \
+ && wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/debian/dists/bookworm/winehq-bookworm.sources \
+ && apt-get update \
+ && apt-get install -y --install-recommends \
+        winehq-stable=${WINE_VERSION} \
+        wine-stable=${WINE_VERSION} \
+        wine-stable-amd64=${WINE_VERSION} \
+        wine-stable-i386=${WINE_VERSION} \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- 3. non-root wine user --------------------------------------------------
+RUN useradd -m -u 1000 -s /bin/bash prtg \
+ && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+# WINEDLLOVERRIDES:
+#   mscoree=b          -> ENABLE .NET via the builtin Mono loader, so the probe's
+#     out-of-process .NET "Engine C" helpers (Sensor System/*.exe: VMware, SQL,
+#     DICOM, HL7, NetApp, RADIUS, mail, …) run. The probe spawns these as child
+#     processes that INHERIT its WINEDLLOVERRIDES, so mscoree must be enabled here.
+#     Safe: the probe is native Delphi and never loads .NET itself, and Wine-Mono is
+#     pre-installed (step 4b) so no "install .NET" prompt fires. Verified: the probe
+#     still cold-connects + "Login OK" with mscoree=b. See docker/DOTNET-ENGINE-C.md.
+#   mshtml=            -> stub out the MSHTML (Trident) installer prompt.
+#   icmp=n             -> force NATIVE for the "icmp" basename. The v2/Momo ICMP
+#     module ships as MonitoringModules/paessler/ICMP/ICMP.dll, whose basename
+#     collides with Wine's builtin C:\windows\system32\icmp.dll (the legacy echo
+#     stub forwarding to iphlpapi). Wine's hardcoded load order prefers the
+#     builtin even when the probe LoadLibrary()s the module by full path, so the
+#     probe got the 8 KB stub instead of the real 1.1 MB module. The stub has no
+#     GetApiLevel export, hence the probe's "Could not load \"ICMP\": GetApiLevel
+#     not found". icmp=n makes Wine load the real PE file -> all 32 modules load.
+#     (The module DOES export GetApiLevel at ordinal 213; it was never reached.)
+ENV WINEPREFIX=/home/prtg/.wine \
+    WINEARCH=win32 \
+    WINEDEBUG=fixme-all,err+module,warn+module \
+    WINEDLLOVERRIDES="mscoree=b;mshtml=;icmp=n" \
+    DISPLAY=:0
+
+# ---- 4. initialise the 32-bit Wine prefix ----------------------------------
+#  wineboot blocks up to 300s waiting for a boot event that never fires when
+#  rpcss can't come up in a fresh prefix; cap it and hard-stop wineserver so the
+#  build layer can't hang. The prefix files are created in the first seconds.
+USER prtg
+WORKDIR /home/prtg
+RUN set -eux; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb.log 2>&1 & \
+    sleep 2; \
+    WINEDEBUG=-all timeout 90 wineboot --init || echo "wineboot capped (expected)"; \
+    timeout 20 wineserver -w || wineserver -k || true; \
+    test -d "$WINEPREFIX/drive_c/windows" && echo "prefix OK"
+
+# ---- 4b. install Wine-Mono so the .NET "Engine C" helpers run --------------
+#  The 52 Sensor System/*.exe helpers (VMware/vSphere SOAP, native SQL via ADO.NET,
+#  DICOM, HL7, NetApp-ONTAP, RADIUS, SIP, mail, IPMI, Xen, …) are .NET Framework
+#  executables the probe shells out to. Wine ships Mono as its .NET implementation;
+#  install the version this Wine build's mscoree.dll expects (Wine 11.0 → 10.4.1).
+#  VMware + SQL are proven returning LIVE data under this runtime — full Engine-C
+#  results and per-helper matrix in docker/DOTNET-ENGINE-C.md.
+USER root
+COPY scripts/install-dotnet.sh /usr/local/bin/install-dotnet.sh
+RUN chmod +x /usr/local/bin/install-dotnet.sh
+USER prtg
+RUN set -eux; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb-mono.log 2>&1 & \
+    sleep 2; \
+    /usr/local/bin/install-dotnet.sh; \
+    timeout 20 wineserver -w || wineserver -k || true
+
+# ---- 5. install the probe payload into the prefix --------------------------
+#  Run the VENDOR Inno Setup installer under Wine (/VERYSILENT) — the SINGLE
+#  extraction method (innoextract is no longer used anywhere in the pipeline). The
+#  installer unpacks Program Files AND writes the SCM service entry into the SAME
+#  prefix the probe later runs in — exactly as on Windows. Lands at
+#  C:\Program Files (x86)\PRTG Network Monitor\.
+#
+#  The installer's [Run] step ends by ShellExec-ing `net start PRTGProbeService`
+#  and polling its own service state, which HANGS under Wine (the service it just
+#  registered has a Wine-corrupted ImagePath; see step 5a). So we let the file +
+#  registry phase complete — detected by the installer log's [Run]/Deinitializing
+#  marker, or the installer process exiting — then kill the redundant hung service
+#  step. run-probe.sh performs the real, clean `net start` at runtime. The probe
+#  binary is NEVER modified; this just unpacks the vendor payload.
+ARG PROBE_DIR="/home/prtg/.wine/drive_c/Program Files (x86)/PRTG Network Monitor"
+COPY --chown=prtg:prtg probe-installer.exe /tmp/probe-installer.exe
+RUN set -eux; \
+    mkdir -p /tmp/xdg; chmod 700 /tmp/xdg; export XDG_RUNTIME_DIR=/tmp/xdg; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb-install.log 2>&1 & \
+    sleep 2; \
+    innolog="$WINEPREFIX/drive_c/inno-install.log"; rm -f "$innolog"; \
+    # XDG_RUNTIME_DIR must be set: without it the PRTG installer's commoninit hits a
+    # Wine code path that returns ERROR_CALL_NOT_IMPLEMENTED (System Error 120) and
+    # aborts before [Files]. With it, the silent install runs to completion.
+    WINEDEBUG=-all wine /tmp/probe-installer.exe \
+        /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /NORESTARTAPPLICATIONS \
+        /DIR='C:\Program Files (x86)\PRTG Network Monitor' \
+        /LOG='C:\inno-install.log' >/tmp/inno-run.log 2>&1 & \
+    ipid=$!; waited=0; max=600; \
+    while [ "$waited" -lt "$max" ]; do \
+        kill -0 "$ipid" 2>/dev/null || { echo "installer exited on its own after ${waited}s"; break; }; \
+        if grep -aqE "start PRTGProbeService|Deinitializing Setup|ssDone|Setup program finished" "$innolog" 2>/dev/null; then \
+            echo "installer file/registry phase complete (log marker after ${waited}s)"; break; \
+        fi; \
+        sleep 3; waited=$((waited+3)); \
+    done; \
+    sleep 2; \
+    pkill -f probe-installer.exe 2>/dev/null || true; \
+    kill "$ipid" 2>/dev/null || true; \
+    pkill -f "PRTG Probe.exe" 2>/dev/null || true; \
+    timeout 20 wineserver -w || wineserver -k || true; \
+    rm -f /tmp/probe-installer.exe; \
+    if [ ! -f "${PROBE_DIR}/PRTG Probe.exe" ]; then \
+        echo "FATAL: installer-under-Wine did not produce 'PRTG Probe.exe'"; \
+        echo "--- inno-run.log ---"; tail -40 /tmp/inno-run.log 2>/dev/null || true; \
+        echo "--- $innolog ---"; tail -60 "$innolog" 2>/dev/null || true; \
+        exit 1; \
+    fi; \
+    echo "probe payload installed ($(find "${PROBE_DIR}" -type f | wc -l) files); build $(grep -aoE '2[0-9]\.[0-9]\.[0-9]{3,}\.[0-9]{3,}' "${PROBE_DIR}/PRTG Probe.exe" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')"
+
+# ---- 5a. repair the SCM ImagePath the Inno installer corrupts under Wine ----
+#  The installer registers PRTGProbeService, but Wine mis-expands the path token so
+#  ImagePath becomes Z:\home\prtg\%SystemDrive%\…\PRTG Probe.exe — `net start` would
+#  launch nothing. Rewrite it to the correct C:\…\PRTG Probe.exe, and force the
+#  service to manual-start (Start=3) so the SOFTPUB regsvr32 step below (and any
+#  later wineboot) can't trip the same auto-start hang. run-probe.sh re-asserts the
+#  exact same values at every boot (register_service); folding the repair into the
+#  build makes the baked image self-consistent. ZERO Paessler-binary modification —
+#  this only fixes a Wine registry-expansion quirk.
+RUN set -eux; \
+    mkdir -p /tmp/xdg; chmod 700 /tmp/xdg; export XDG_RUNTIME_DIR=/tmp/xdg; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb-imagepath.log 2>&1 & \
+    sleep 2; \
+    KEY='HKLM\System\CurrentControlSet\Services\PRTGProbeService'; \
+    echo "ImagePath BEFORE repair:"; WINEDEBUG=-all wine reg query "$KEY" /v ImagePath 2>&1 | tr -d '\r' || true; \
+    WINEDEBUG=-all wine reg add "$KEY" /v ImagePath /t REG_EXPAND_SZ \
+        /d '"C:\Program Files (x86)\PRTG Network Monitor\PRTG Probe.exe"' /f; \
+    WINEDEBUG=-all wine reg add "$KEY" /v Start /t REG_DWORD /d 3 /f; \
+    WINEDEBUG=-all wine reg add "$KEY" /v Type  /t REG_DWORD /d 16 /f; \
+    echo "ImagePath AFTER repair:"; \
+    WINEDEBUG=-all wine reg query "$KEY" /v ImagePath 2>&1 | tr -d '\r' | tee /tmp/imagepath.txt; \
+    grep -qi 'C:\\Program Files (x86)\\PRTG Network Monitor\\PRTG Probe.exe' /tmp/imagepath.txt \
+        && echo "ImagePath repaired OK" || { echo "FATAL: ImagePath repair did not take"; exit 1; }; \
+    timeout 20 wineserver -w || wineserver -k || true
+
+# ---- 5b. unlock the v2/"Momo" monitoring modules (clean Authenticode fix) --
+#  PRTG Probe.exe gates every MonitoringModules/paessler/*.dll on
+#  WinVerifyTrust(GENERIC_VERIFY_V2) and then extracts the signer certificate to
+#  confirm it is Paessler's. The modules are validly Authenticode-signed (Paessler
+#  GmbH -> SSL.com Code Signing CA -> SSL.com Root, SHA-256, timestamped).
+#
+#  Stock Wine 11.0 fails this for a crypt32 bug: when verifying a PKCS#7 signer's
+#  signature it re-encodes the SignedAttributes via CryptEncodeObjectEx(PKCS_
+#  ATTRIBUTES), which SORTS the SET into DER-canonical order before hashing.
+#  Microsoft signtool emits those attributes UNSORTED and signs the bytes as they
+#  appear; Windows hashes them as-received. Wine's re-sorted hash never matches,
+#  so verification returns TRUST_E_CERT_SIGNATURE for every signtool-signed binary.
+#
+#  We replace Wine's builtin crypt32.dll with a one-function-patched build that
+#  hashes the SignedAttributes in their original on-the-wire order on the verify
+#  path (signing path unchanged). With this + the trust-provider registration in
+#  step 4, WinVerifyTrust genuinely validates the real Paessler signatures (full
+#  cert chain to the SSL.com root in /etc/ssl/certs) AND still rejects unsigned /
+#  tampered DLLs. The probe binary itself is never modified — the signature check
+#  is restored at the Wine layer, not bypassed.
+#
+#  Patch + reproducible build: docker/wine-patches/ (crypt32-msg.c.patch,
+#  build-crypt32.sh). Full write-up: docker/CERT-IMPORT-FIX.md.
+COPY wine-patches/crypt32.dll \
+     /opt/wine-stable/lib/wine/i386-windows/crypt32.dll
+
+# ---- 5b'. Wine kernelbase.dll: ImpersonateLoggedOnUser(NULL) -> revert-to-self
+#  .NET's WindowsIdentity.Impersonate(IntPtr.Zero) means "revert to self / no
+#  impersonation" and succeeds on Windows. Mono implements it as Win32
+#  ImpersonateLoggedOnUser(NULL); stock Wine returns FALSE there (GetTokenInformation
+#  (NULL) fails), so Mono raises SecurityException "Couldn't impersonate token." This
+#  one-function-patched builtin makes the NULL/revert case succeed (verified: a valid
+#  token already impersonates fine; only the IntPtr.Zero sentinel was unhandled). It
+#  is a strict superset of stock behavior — no code that relies on the documented
+#  failure path exists in the probe. With this open-source Wine fix the vendor-original
+#  LastWinUpdateXML.exe impersonation path works without modifying that binary (same
+#  philosophy as the crypt32 fix above).
+#  Patch + reproducible build: docker/wine-patches/ (patch-kernelbase-impersonate.py,
+#  build-kernelbase.sh). Analysis: docker/DOTNET-ENGINE-C.md.
+COPY wine-patches/kernelbase.dll \
+     /opt/wine-stable/lib/wine/i386-windows/kernelbase.dll
+
+#  Register the SOFTPUB Authenticode trust provider in the prefix. A fresh Wine
+#  prefix leaves HKLM\...\Cryptography\Providers\Trust\* (and the PE Subject
+#  Interface Package under ...\Cryptography\OID) EMPTY, so WinVerifyTrust is a
+#  silent no-op: it returns success, parses nothing, and yields an empty signer
+#  chain. The probe's module loader needs WinVerifyTrust to actually validate the
+#  signature AND populate the signer cert so it can confirm the Paessler identity.
+#  `regsvr32 wintrust.dll` (DllRegisterServer) registers the provider + SIP
+#  functions; it is baked into the prefix here. It is run now (not during the
+#  step-4 fresh-prefix wineboot, which is capped and leaves Wine services half-up,
+#  hanging regsvr32) — by this point the prefix is fully established.
+USER prtg
+RUN set -eux; \
+    mkdir -p /tmp/xdg; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb-trust.log 2>&1 & \
+    sleep 2; \
+    WINEDEBUG=-all XDG_RUNTIME_DIR=/tmp/xdg timeout 60 \
+        wine regsvr32 wintrust.dll || echo "regsvr32 wintrust returned non-zero"; \
+    timeout 20 wineserver -w || wineserver -k || true; \
+    # fail the build if the provider did not register (the whole point of this step)
+    WINEDEBUG=-all wine reg query \
+      'HKLM\Software\Microsoft\Cryptography\Providers\Trust\FinalPolicy\{00AAC56B-CD44-11D0-8CC2-00C04FC295EE}' \
+      | grep -qi 'WINTRUST.DLL' && echo "SOFTPUB trust provider registered"
+
+# ---- 5b-bis. auto-update interception shim ---------------------------------
+#  Replace the probe's PRTGProbeUpdate.exe with our stub (the "installer execution
+#  shim"). When the core pushes an update, "PRTG Probe.exe" downloads the new
+#  installer and launches PRTGProbeUpdate(_tmp).exe to STOP the service, taskkill
+#  the probe, and run the Inno installer IN PLACE — which under Wine would mutate /
+#  corrupt the live prefix. The shim instead just records the request (intercept
+#  log + update-requested.flag) and exits 0, leaving the running probe untouched;
+#  the prtg-updater sidecar rebuilds a fresh image with build-probe.py and swaps the
+#  container cleanly. The original updater is kept as PRTGProbeUpdate.orig.exe so the
+#  swap is fully reversible. Set --build-arg ENABLE_UPDATE_SHIM=0 to ship the stock
+#  updater. See docker/AUTO-UPDATE.md and scripts/update-shim/.
+ARG ENABLE_UPDATE_SHIM=1
+COPY --chown=prtg:prtg scripts/update-shim/PRTGProbeUpdate.shim.exe \
+     "${PROBE_DIR}/PRTGProbeUpdate.shim.exe"
+RUN if [ "$ENABLE_UPDATE_SHIM" = "1" ]; then \
+        cp -n "${PROBE_DIR}/PRTGProbeUpdate.exe" "${PROBE_DIR}/PRTGProbeUpdate.orig.exe" && \
+        cp "${PROBE_DIR}/PRTGProbeUpdate.shim.exe" "${PROBE_DIR}/PRTGProbeUpdate.exe" && \
+        echo "[update-shim] PRTGProbeUpdate.exe replaced with interception shim (orig kept)"; \
+    else echo "[update-shim] disabled (ENABLE_UPDATE_SHIM=0) — stock updater kept"; fi
+
+# ---- 5c. WMI facade — make the probe's NATIVE WMI sensors work --------------
+#  Two pieces let the native WMI sensor classes work against remote Windows hosts
+#  (Wine's wbemprox is local-only and its wbemdisp automation is half-implemented):
+#
+#  (1) wbemfacade.dll — re-implements the COM object behind CLSID_WbemLocator and
+#      forwards WQL+creds to the Impacket sidecar (real remote DCOM/WMI).
+#      seed-registry.sh repoints CLSID_WbemLocator at it on boot.
+#      Build: docker/wmi-bridge/facade/build.sh (i686-w64-mingw32).
+#
+#  (2) wbemdisp.dll — a patched build of Wine 11.0's WbemScripting automation
+#      layer that implements the property/qualifier surface the probe's
+#      that the probe's WMI dataset reader needs but Wine left as stubs (propertyset
+#      enumeration, property Name/CIMType/IsArray/IsLocal/Origin, and an
+#      ISWbemQualifierSet). Replaces the Wine builtin in the install tree.
+#      Build: docker/wmi-bridge/facade/build-wbemdisp.sh (Wine source + mingw).
+#
+#  See docker/WMI-FACADE.md. Both DLLs are prebuilt artifacts committed in the repo.
+COPY --chown=prtg:prtg wmi-bridge/facade/wbemfacade.dll \
+     "/home/prtg/.wine/drive_c/windows/system32/wbem/wbemfacade.dll"
+COPY wmi-bridge/facade/wbemdisp.dll \
+     /opt/wine-stable/lib/wine/i386-windows/wbemdisp.dll
+
+#  (3) System.Management.dll — a compatibility build of Wine-Mono's open-source
+#      System.Management (installed in 4b). Stock Mono throws NotImplementedException
+#      whenever explicit credentials are passed to a WMI query (WmiNetUtilsHelper.
+#      AuthNotSup); the patch neutralises that guard so the probe's .NET "Engine C"
+#      WMI helpers (UserLoggedin, WinOSVersion, VolumeFrag, PrintQueue, ADSRepl, …)
+#      can do REMOTE WMI through the same facade+sidecar. The facade was also extended
+#      to synthesize WMI system properties (__GENUS/__CLASS/__SERVER/__NAMESPACE/__PATH)
+#      and the sink-based async query path .NET's System.Management uses by default.
+#      Regenerate with wmi-bridge/facade/patch-system-management/. See docker/DOTNET-ENGINE-C.md.
+COPY --chown=prtg:prtg wmi-bridge/facade/System.Management.patched.dll \
+     "/home/prtg/.wine/drive_c/windows/mono/mono-2.0/lib/mono/gac/System.Management/4.0.0.0__b03f5f7f11d50a3a/System.Management.dll"
+
+# ---- 5d. PowerShell (PSRP) bridge + Windows-Update helper -------------------
+#  Let the .NET "Engine C" helpers that are PSRP clients (run cmdlets on a remote
+#  Windows server over WSMan) and the legacy WUApiLib Windows-Update helper work
+#  under Wine. All route to the psrp-sidecar (127.0.0.1:8911 — Dockerfile.sidecar).
+#  Full writeup: docker/ENGINE-C-POWERSHELL.md.
+#
+#  (1) System.Management.Automation.dll — Mono SMA shim. Mono binds it to the
+#      helpers' standard SMA assembly identity; Pipeline.Invoke POSTs to the sidecar /psrp.
+#      Drives ExchangeSensorPS and LastWindowsUpdateSensor (live, 16 channels).
+#  (2) Paessler.Config.dll — shipped VENDOR-ORIGINAL (unmodified, never touched).
+#      NOTE: the SCVMM sensor (SCVMMSensor.exe) is UNSUPPORTED. It references
+#      a constructor overload this build's bundled config library does not expose.
+#      That is a packaging version-skew: the SCVMM helper was built against a
+#      different build of the config library. CLR member resolution matches by exact
+#      signature on BOTH Mono and .NET Framework, so the unmodified pair throws the
+#      SAME MissingMethodException on genuine Windows PRTG.
+#      We ship the config library vendor-original and match the product's actual
+#      behavior rather than transform a vendor assembly at runtime. SCVMM is the only
+#      sensor affected; Exchange and Windows Update are unaffected.
+#  (3) Interop.WUApiLib.dll — shim for the legacy LastWinUpdateXML.exe WUApiLib COM
+#      surface; UpdateSearcher.Search() -> sidecar /wua (WUA via a SYSTEM scheduled task).
+#  (4) LastWinUpdateXML.exe — shipped VENDOR-ORIGINAL. The legacy EXE would hang in a WinForms
+#      error-dialog message loop under stock Wine because its headless check
+#      (try{Console.CursorVisible}catch{headless=true}) never throws under Mono. That is fixed
+#      in the open-source runtime (patched Wine-Mono mscorlib, step 4b''), not by patching the
+#      vendor binary. Plus kernelbase (Impersonate) + the wrapper's -c=localhost rewrite (local
+#      path) + the WUApiLib shim (counts bridged via prtg_host) + the wrapper's date injection.
+#      (The modern PowerShell LastWindowsUpdateSensor remains the preferred WU sensor; this
+#      makes the legacy one work, vendor-original, too.)
+ARG SS="/home/prtg/.wine/drive_c/Program Files (x86)/PRTG Network Monitor/Sensor System"
+COPY --chown=prtg:prtg powershell-bridge/System.Management.Automation.dll "${SS}/System.Management.Automation.dll"
+COPY --chown=prtg:prtg powershell-bridge/Interop.WUApiLib.dll             "${SS}/Interop.WUApiLib.dll"
+#  Paessler.Config.dll is intentionally NOT overwritten and NOT augmented — the installer's
+#  VENDOR-ORIGINAL binary is what runs (see note (2): the SCVMM-only ctor skew is a vendor
+#  packaging defect that also fails on genuine Windows, so we match the product).
+#
+#  Wine-Mono mscorlib console fix (run at entrypoint; see run-probe.sh:patch_mono_console).
+#  It rewrites Mono's OWN open-source mscorlib (never a Paessler binary) and needs Mono.Cecil
+#  at runtime; both ship in /opt/mono-fix/.
+COPY --chown=prtg:prtg wine-patches/patch-mono-console/out/patch-mono-console.exe /opt/mono-fix/patch-mono-console.exe
+COPY --chown=prtg:prtg wine-patches/patch-mono-console/out/Mono.Cecil.dll         /opt/mono-fix/Mono.Cecil.dll
+#  LastWinUpdateXML.exe is shipped VENDOR-ORIGINAL. The
+#  unmodified helper works via: the patched Wine-Mono mscorlib (Console.CursorVisible throws on
+#  redirect → headless detection fires, no WinForms-dialog hang; step 4b'') + the patched Wine
+#  kernelbase (Impersonate(NULL)) + the deployment model in lastwinupdate-wrapper.sh (rewrites
+#  -c=<host>→-c=localhost so the local-registry path is taken while the WUApiLib shim bridges
+#  the update query to the real target via prtg_host). Verified live: emits valid PRTG XML with
+#  real data. count-mode (extra count channels) is the helper's own runtime flag (vendor
+#  feature), not patched. See docker/DOTNET-ENGINE-C.md / ENGINE-C-POWERSHELL.md.
+#  (5) LastWindowsUpdateSensor.exe — the MODERN PowerShell "Windows Updates Status" sensor.
+#      The VENDOR-ORIGINAL binary is shipped as-is (unpacked by the Inno installer in step 5).
+#
+#      The binary needs no modification: its reverse-DNS host-resolution branch
+#      (taken when an IP is given with Kerberos auth) does NOT fail on this runtime. Mono's
+#      Dns.GetHostEntry(IPAddress) only throws when the resolver returns an ERROR; for a clean
+#      negative answer it returns the literal IP as the host name. The container resolves via
+#      systemd-resolved (127.0.0.53), which returns NXDOMAIN ("not found"), not SERVFAIL — so for
+#      an IP with no PTR the helper simply gets the IP back as the host name and proceeds
+#      (verified live). The PSRP shim auths with Negotiate regardless, so the unchanged IP is
+#      what reaches the bridge — and the vendor binary is left untouched.
+#
+#      Fallback if a site's resolver returns SERVFAIL for PTR queries (rare): set the sensor's
+#      AuthenticationMechanism to Negotiate (also proven live) so the Kerberos branch is skipped.
+#      The binary ships vendor-original; the only runtime aid is the open-source Wine-Mono
+#      mscorlib console fix (patch-mono-console, step 4b'') for the legacy LastWinUpdateXML
+#      headless hang. See docker/ENGINE-C-POWERSHELL.md and docker/DOTNET-ENGINE-C.md.
+USER root
+COPY powershell-bridge/lastwinupdate-wrapper.sh /usr/local/bin/lastwinupdate-wrapper.sh
+RUN chmod +x /usr/local/bin/lastwinupdate-wrapper.sh
+USER prtg
+
+# ---- 5e. custom-sensor support ---------------------------------------------
+#  Installs PowerShell Core 7.6.2 (pwsh) for the PowerShell-Script bridge and
+#  stages the EXE/Script families into the probe's Custom Sensors tree:
+#    - EXEXML\{docker-test,py-sensor,ps-sensor}.bat  + /opt bridge runners
+#      (EXEXML / Python-via-python3 / PowerShell-via-pwsh — all Up w/ live data)
+#    - EXE\docker-exe-test.bat        (plain exe: "value:message" + exit code)
+#    - rest\docker-rest-test.template (REST Custom JSONPath template, Momo v2 Rest.dll)
+#  Runs as root: pwsh lands in /opt + symlinked to /usr/bin, the staged sensor
+#  files are chowned back to prtg. Needs build-time network (downloads pwsh), as
+#  does 4b. Lookups (.ovl) + device icons/maps are CORE-side and deliberately NOT
+#  staged here — a probe never resolves them (PE272 proof). See docker/CUSTOM-SENSORS.md.
+USER root
+COPY custom-sensors /tmp/custom-sensors
+RUN /tmp/custom-sensors/install-custom-sensors.sh \
+ && rm -rf /tmp/custom-sensors
+USER prtg
+
+# Pre-create the PRTG data tree (logs + state). This is the path exported as a
+# VOLUME below; its contents here seed a fresh named volume on first run.
+RUN mkdir -p "/home/prtg/.wine/drive_c/ProgramData/Paessler/PRTG Network Monitor/Logs (Probe)" \
+ && mkdir -p "/home/prtg/.wine/drive_c/ProgramData/Paessler/PRTG Network Monitor/Logs/probe"
+
+# ---- 6. scripts -------------------------------------------------------------
+USER root
+COPY scripts/entrypoint.sh   /usr/local/bin/entrypoint.sh
+COPY scripts/run-probe.sh    /usr/local/bin/run-probe.sh
+COPY scripts/seed-registry.sh /usr/local/bin/seed-registry.sh
+COPY scripts/healthcheck.sh  /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/run-probe.sh \
+             /usr/local/bin/seed-registry.sh /usr/local/bin/healthcheck.sh
+
+USER prtg
+# The image is GENERIC — it carries NO deployment-specific identity. The core
+# address, access key, probe GId and display name are supplied at run time via
+# docker-compose env / .env (see .env.example) and written into the Wine registry
+# by seed-registry.sh on every boot. This keeps one image usable against ANY PRTG
+# core. Only the runtime MODE (which Wine SCM lifecycle to drive) and the standard
+# probe-connection port are baked, both overridable.
+#  - PROBE_KEY  → written as Probe\Password REG_DWORD 0x<key> (the format the core accepts)
+#  - PROBE_GID  → reuse an approved identity to reconnect straight to Up; omit for a new probe
+#  - MODE=services → drives Wine's SCM lifecycle (the only mode that stays connected cold)
+ENV CORE_PORT=23560 \
+    MODE=services
+
+# ---- 7. persistent state volume --------------------------------------------
+#  The probe's data directory: logs, monitoring-module state, sensor cache.
+#  A named volume here keeps that state across container restarts/recreations.
+#  (Probe identity also lives in the Wine registry, which the scripts re-seed
+#   idempotently from the env vars on every boot, so identity is stable too.)
+VOLUME ["/home/prtg/.wine/drive_c/ProgramData/Paessler/PRTG Network Monitor"]
+
+# ---- 8. healthcheck ---------------------------------------------------------
+#  Healthy once the probe holds an ESTABLISHED session to the core and has logged
+#  in. start-period covers cold boot: wineboot + net start + SSL handshake +
+#  login is ~20-60s from a cold prefix.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/usr/local/bin/run-probe.sh"]

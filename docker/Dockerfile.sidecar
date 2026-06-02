@@ -1,0 +1,43 @@
+# =============================================================================
+#  PRTG probe sidecars — ONE image, BOTH bridges (host network alongside the probe)
+# =============================================================================
+#  Wine cannot do remote WMI (wbemprox is local-only) nor PSRP/WSMan PowerShell
+#  remoting, so two Python services run beside the probe and the probe's helpers
+#  reach them on loopback:
+#     :8910  wmi-sidecar.py  — Impacket WMI-over-DCOM   (docker/WMI-ANALYSIS.md / WMI-FACADE.md)
+#     :8911  psrp-sidecar.py — pypsrp PSRP-over-WSMan    (docker/ENGINE-C-POWERSHELL.md)
+#
+#  Build (context = docker/):
+#    docker build --platform linux/amd64 -f Dockerfile.sidecar -t wmi-bridge:1.0 .
+#  Run (host net so the probe sees 127.0.0.1:8910/8911 and it can dial DCOM/WSMan on the LAN):
+#    docker run -d --name wmi-sidecar --network host --restart unless-stopped \
+#      -v /opt/wmi-bridge:/etc/wmi-bridge:ro wmi-bridge:1.0
+#  Per-target WMI creds live in /etc/wmi-bridge/targets.json (mode 600). The PSRP
+#  sidecar is stateless — the .NET helpers carry creds per request (from PRTG).
+# =============================================================================
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm
+
+# Pinned to known-good versions (see docker/ENGINE-C-POWERSHELL.md).
+RUN pip install --no-cache-dir \
+        impacket==0.13.1 \
+        pypsrp==0.9.1
+
+COPY wmi-bridge/wmi-sidecar.py        /opt/wmi-sidecar.py
+COPY powershell-bridge/psrp-sidecar.py /opt/psrp-sidecar.py
+COPY scripts/run-sidecars.sh          /opt/run-sidecars.sh
+RUN chmod +x /opt/run-sidecars.sh
+
+ENV WMI_BRIDGE_ADDR=127.0.0.1 \
+    WMI_BRIDGE_PORT=8910 \
+    WMI_BRIDGE_CONFIG=/etc/wmi-bridge/targets.json \
+    PSRP_BRIDGE_ADDR=127.0.0.1 \
+    PSRP_BRIDGE_PORT=8911
+
+EXPOSE 8910 8911
+
+# The sidecars need no root: they bind loopback (non-privileged ports) and dial
+# DCOM/WSMan outbound. Run them as an unprivileged user.
+RUN useradd --system --uid 1000 --no-create-home --shell /usr/sbin/nologin sidecar
+USER sidecar
+
+ENTRYPOINT ["/opt/run-sidecars.sh"]
