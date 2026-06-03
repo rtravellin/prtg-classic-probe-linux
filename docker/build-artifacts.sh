@@ -17,12 +17,13 @@
 #                                                  (Wine-Mono mscorlib console fix)
 #        scripts/update-shim/PRTGProbeUpdate.shim.exe  (MinGW C — update interceptor)
 #
-#   B. CONTEXT-COUPLED (NOT built here — they need either the probe container's
-#      Wine-Mono runtime, or YOUR OWN pristine Paessler/Mono binaries as input,
-#      so they are produced as part of the image build, not standalone):
-#        powershell-bridge/System.Management.Automation.dll  (Mono mcs, in-container)
-#        powershell-bridge/Interop.WUApiLib.dll              (Mono mcs, in-container)
-#        wmi-bridge/facade/System.Management.patched.dll      (compatibility build of Wine-Mono System.Management.dll)
+#   B. IN-IMAGE (NOT built here, and you don't build them by hand either — they need
+#      the probe image's OWN Wine-Mono runtime, which doesn't exist until the image is
+#      built, so Dockerfile.prod compiles them in place during the build, step 5d-bis /
+#      scripts/build-class-b.sh, from the committed C# sources):
+#        powershell-bridge/System.Management.Automation.dll  (Wine-Mono mcs, in-image)
+#        powershell-bridge/Interop.WUApiLib.dll              (Wine-Mono mcs, in-image)
+#        wmi-bridge/facade/System.Management.patched.dll      (in-image Mono.Cecil rewrite of Wine-Mono System.Management.dll)
 #      (LastWinUpdateXML.exe is NOT modified — it ships vendor-original; the headless
 #       hang is fixed in the open-source runtime via patch-mono-console.exe, built in A1c above.)
 #      See "CLASS B" guidance printed at the end and docker/ENGINE-C-POWERSHELL.md /
@@ -120,24 +121,22 @@ for s in "${skipped[@]:-}"; do [ -n "$s" ] && note "FAILED:  $s"; done
 cat <<'EOF'
 
 ------------------------------------------------------------------------------
- CLASS B — the remaining artifacts are produced from binaries on YOUR system
- (Paessler's helpers / Wine-Mono), so they are built during the image build,
- not by this script:
+ CLASS B — built AUTOMATICALLY and IN-IMAGE; nothing to do here.
+ These three artifacts are derived from the probe image's OWN Wine-Mono runtime,
+ which does not exist until the image is built, so Dockerfile.prod compiles them
+ in place during the build (step 5d-bis, scripts/build-class-b.sh) from the
+ committed C# sources — no prebuilt DLLs, no host .NET SDK, no extra flags:
 
    * System.Management.Automation.dll, Interop.WUApiLib.dll
-       Mono shims compiled in-container against Wine-Mono. They are built when
-       you run the image build with shim compilation enabled; see
-       docker/ENGINE-C-POWERSHELL.md (build-sma-shim.sh runs inside the prefix).
+       Mono shims compiled in-image with this image's Wine-Mono `mcs`
+       (sources: powershell-bridge/{sma-shim,wuapi-shim}.cs).
+       See docker/ENGINE-C-POWERSHELL.md.
 
    * wmi-bridge/facade/System.Management.patched.dll
-       A compatibility build of Wine-Mono's OWN open-source System.Management.dll
-       (never a Paessler binary). Rebuild it with:
-
-           ./build-probe.py /path/to/installer.exe \
-                            --core-server <fqdn> --rebuild-dotnet-patches ...
-
-       (needs the .NET SDK on PATH). The patch source lives in
-       wmi-bridge/facade/patch-system-management/.
+       A Mono.Cecil rewrite of Wine-Mono's OWN open-source System.Management.dll
+       (never a Paessler binary), applied in-image to the prefix's GAC copy
+       (source: wmi-bridge/facade/patch-system-management/Program.cs, run with the
+       Mono.Cecil.dll built in A1c above).
 
        NOTE: LastWinUpdateXML.exe and Paessler.Config.dll are NOT patched and NOT
        augmented — both ship VENDOR-ORIGINAL. The legacy LastWinUpdateXML headless-hang

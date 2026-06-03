@@ -55,21 +55,26 @@ from pathlib import Path
 # the build, so the package never ships a tampered probe.
 PROBE_EXE_REL = "PRTG Probe.exe"
 
-# Version-/Wine-coupled compatibility artifacts the Dockerfile COPYs in. These are
-# build OUTPUTS, not committed to the repo — produce them with ./build-artifacts.sh
-# (and --rebuild-dotnet-patches for the .NET ones). Validated here for PE sanity.
-# (name -> human description).
+# Compatibility artifacts the Dockerfile depends on. These are build OUTPUTS / sources,
+# not committed binaries. There are two classes, by WHERE the compiled artifact is made
+# (see docker/build-artifacts.sh for the same A/B split):
+#
+#   CLASS A — host-buildable. Produced standalone by ./build-artifacts.sh (needs only
+#   Docker). They MUST exist before the image build — Dockerfile.prod COPYs them in and
+#   there is no way to (re)create them inside the build. Missing => FATAL. (PE-validated.)
+#
+#   CLASS B — built IN-IMAGE. Each is derived from the probe container's OWN Wine-Mono
+#   runtime (the two Mono shims are compiled with Wine-Mono's mcs; the System.Management
+#   compatibility build is a Mono.Cecil rewrite of Wine-Mono's own System.Management.dll,
+#   whose input only exists inside the prefix). They therefore CANNOT exist on a fresh
+#   clone, and are no longer COPYd from the build context: Dockerfile.prod step 5d-bis
+#   compiles them in place (scripts/build-class-b.sh). The build context only needs the
+#   C# SOURCES the in-image build consumes — validated below for presence (not as PEs).
 PATCH_ARTIFACTS = {
-    "powershell-bridge/System.Management.Automation.dll":
-        "SMA shim — Pipeline.Invoke -> PSRP sidecar",
-    "powershell-bridge/Interop.WUApiLib.dll":
-        "WUApiLib shim — UpdateSearcher.Search -> WUA sidecar",
     "wmi-bridge/facade/wbemfacade.dll":
         "WMI facade — CLSID_WbemLocator -> Impacket sidecar",
     "wmi-bridge/facade/wbemdisp.dll":
         "Patched Wine WbemScripting automation layer",
-    "wmi-bridge/facade/System.Management.patched.dll":
-        "Wine-Mono System.Management — credentialed-WMI compatibility build (open-source)",
     "wine-patches/crypt32.dll":
         "Patched Wine crypt32 — Authenticode SignedAttrs on-wire-order verify fix",
     "wine-patches/kernelbase.dll":
@@ -77,16 +82,22 @@ PATCH_ARTIFACTS = {
     "wine-patches/patch-mono-console/out/patch-mono-console.exe":
         "Wine-Mono mscorlib console fix — run at entrypoint (CursorVisible throw-on-redirect)",
     "wine-patches/patch-mono-console/out/Mono.Cecil.dll":
-        "Mono.Cecil (MIT library) — used by the mscorlib console fix at runtime",
+        "Mono.Cecil (MIT library) — mscorlib console fix at runtime + the in-image System.Management patch",
 }
 
-# .NET compatibility-build projects (rebuilt only with --rebuild-dotnet-patches; needs dotnet).
-# NOTE: the LastWinUpdateXML / LastWindowsUpdateSensor binaries ship VENDOR-ORIGINAL;
-# the headless-hang is fixed in the open-source runtime instead (patched Wine-Mono
-# mscorlib Console.CursorVisible, built by build-artifacts.sh -> patch-mono-console.exe;
-# see wine-patches/patch-mono-console).
-DOTNET_PATCH_PROJECTS = {
-    "wmi-bridge/facade/patch-system-management": "System.Management.patched.dll",
+# CLASS B sources — the committed inputs Dockerfile.prod step 5d-bis compiles in-image
+# (with this image's own Wine-Mono mcs / Mono.Cecil) into the three compatibility DLLs.
+# We sanity-check that these SOURCES are present (their absence would break the image
+# build's COPY/compile); the compiled DLLs themselves are never staged in the context.
+INIMAGE_SOURCES = {
+    "scripts/build-class-b.sh":
+        "in-image Class B build driver (compiles + installs all three)",
+    "powershell-bridge/sma-shim.cs":
+        "SMA shim source -> Sensor System/System.Management.Automation.dll",
+    "powershell-bridge/wuapi-shim.cs":
+        "WUApiLib shim source -> Sensor System/Interop.WUApiLib.dll",
+    "wmi-bridge/facade/patch-system-management/Program.cs":
+        "Mono.Cecil patcher source -> Wine-Mono GAC System.Management.dll (AuthNotSup -> ret)",
 }
 
 DEFAULT_CORE_PORT = "23560"
@@ -220,43 +231,55 @@ def is_pe(path):
         return False
 
 
-def validate_patch_artifacts(context):
-    missing, bad = [], []
-    for rel, desc in PATCH_ARTIFACTS.items():
+def _scan_artifacts(context, artifacts):
+    """Partition an artifact map into (present_and_valid, missing, bad)."""
+    present, missing, bad = [], [], []
+    for rel, desc in artifacts.items():
         f = context / rel
         if not f.is_file():
             missing.append((rel, desc)); continue
         if f.stat().st_size == 0 or not is_pe(f):
             bad.append((rel, desc)); continue
+        present.append((rel, desc))
         info(f"{rel}  ({f.stat().st_size:,} B)  — {desc}")
+    return present, missing, bad
+
+
+def validate_patch_artifacts(context):
+    # ---- CLASS A: host-buildable; required before the image build ----
+    _present, missing, bad = _scan_artifacts(context, PATCH_ARTIFACTS)
     if missing:
         for rel, desc in missing:
             warn(f"MISSING patch artifact: {rel} ({desc})")
-        die("one or more patch artifacts are missing from the build context.\n"
-            "       This repo ships NO compiled binaries — build them from source first:\n"
+        die("one or more host-buildable (Class A) patch artifacts are missing from the\n"
+            "       build context. This repo ships NO compiled binaries — build them first:\n"
             "         ./build-artifacts.sh                 # host-buildable (Docker)\n"
-            "         ./build-probe.py --rebuild-dotnet-patches ...   # .NET compatibility builds\n"
             "       See build-artifacts.sh and docker/BUILD-TOOL.md.")
     if bad:
         for rel, desc in bad:
             warn(f"CORRUPT/empty patch artifact (no MZ header): {rel}")
-        die("one or more patch artifacts failed the PE sanity check")
-    ok(f"all {len(PATCH_ARTIFACTS)} patch artifacts present and PE-valid")
+        die("one or more Class A patch artifacts failed the PE sanity check")
+    ok(f"all {len(PATCH_ARTIFACTS)} host-buildable (Class A) patch artifacts present and PE-valid")
 
-
-def rebuild_dotnet_patches(context):
-    if shutil.which("dotnet") is None:
-        warn("--rebuild-dotnet-patches given but 'dotnet' not on PATH; skipping rebuild")
-        return
-    for proj, _ in DOTNET_PATCH_PROJECTS.items():
-        d = context / proj
-        if not (d / "patch.csproj").is_file():
-            warn(f"no patch.csproj in {proj}; skipping"); continue
-        info(f"rebuilding .NET compatibility build in {proj}")
-        r = run(["dotnet", "run", "--project", str(d)], cwd=str(d))
-        if r.returncode != 0:
-            warn(f"compatibility-build rebuild failed in {proj} (exit {r.returncode}) — "
-                 f"existing artifact (if any) left in place")
+    # ---- CLASS B sources: inputs to the IN-IMAGE build (Dockerfile.prod step 5d-bis) ----
+    # The three Class B DLLs are no longer staged in the context — they are compiled in
+    # place during the image build from these committed C# sources. We only check the
+    # sources are present (their absence would break the in-image COPY/compile). They are
+    # text, not PEs, so this is a presence/non-empty check, not a PE check.
+    src_missing = []
+    for rel, desc in INIMAGE_SOURCES.items():
+        f = context / rel
+        if not f.is_file() or f.stat().st_size == 0:
+            src_missing.append((rel, desc)); continue
+        info(f"{rel}  ({f.stat().st_size:,} B)  — {desc}")
+    if src_missing:
+        for rel, desc in src_missing:
+            warn(f"MISSING Class B source: {rel} ({desc})")
+        die("one or more Class B sources are missing from the build context. These are the\n"
+            "       inputs Dockerfile.prod compiles in-image (step 5d-bis); without them the\n"
+            "       image build cannot produce the SMA / WUApiLib / System.Management artifacts.")
+    ok(f"all {len(INIMAGE_SOURCES)} Class B sources present "
+       f"(compiled in-image by scripts/build-class-b.sh — no prebuilt DLLs needed)")
 
 
 # ---- syntax checks -----------------------------------------------------------
@@ -566,13 +589,19 @@ def write_outputs(out, cfg):
 def validate_compose(docker, out):
     cmd = docker_argv(docker) + ["compose", "-f", str(out / "docker-compose.yml"),
                                  "--env-file", str(out / ".env"), "config", "-q"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode == 0:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        rc, err = r.returncode, (r.stderr or r.stdout or "")
+    except FileNotFoundError:
+        # the docker binary itself isn't on PATH (not just the daemon down) — the
+        # fallback below is exactly for this case, so don't let it crash the run.
+        rc, err = 127, f"{docker_argv(docker)[0]}: command not found"
+    if rc == 0:
         ok("docker compose config validates")
         return
     # docker unavailable / sudo-gated: fall back to a stdlib structural check so the
     # generated files are still verified without depending on the docker daemon.
-    detail = (r.stderr or r.stdout or "").strip().splitlines()
+    detail = err.strip().splitlines()
     if detail:
         info(_c(f"(docker compose config unavailable: {detail[-1]})", C.DIM))
     compose = (out / "docker-compose.yml").read_text()
@@ -654,8 +683,6 @@ def main():
     ap.add_argument("--no-build", action="store_true", help="stage + config only, skip docker build")
     ap.add_argument("--skip-sidecar", action="store_true")
     ap.add_argument("--skip-admin", action="store_true")
-    ap.add_argument("--rebuild-dotnet-patches", action="store_true",
-                    help="rebuild the .NET compatibility builds from source (needs dotnet)")
     ap.add_argument("--smoke-test", action="store_true",
                     help="cold-run the built probe image and poll its healthcheck")
     ap.add_argument("--docker", default="docker", help='docker command (e.g. "sudo docker")')
@@ -725,9 +752,7 @@ def main():
     info("the staged installer is run under Wine (/VERYSILENT) by Dockerfile.prod; "
          "the probe-binary integrity gate is verified post-build, in the image")
 
-    step("Validate prebuilt patch artifacts")
-    if args.rebuild_dotnet_patches:
-        rebuild_dotnet_patches(context)
+    step("Validate patch artifacts (Class A) + Class B sources")
     validate_patch_artifacts(context)
     info("ICMP override: WINEDLLOVERRIDES has 'icmp=n' (baked in Dockerfile.prod env)")
 

@@ -326,17 +326,17 @@ COPY --chown=prtg:prtg wmi-bridge/facade/wbemfacade.dll \
 COPY wmi-bridge/facade/wbemdisp.dll \
      /opt/wine-stable/lib/wine/i386-windows/wbemdisp.dll
 
-#  (3) System.Management.dll — a compatibility build of Wine-Mono's open-source
-#      System.Management (installed in 4b). Stock Mono throws NotImplementedException
-#      whenever explicit credentials are passed to a WMI query (WmiNetUtilsHelper.
-#      AuthNotSup); the patch neutralises that guard so the probe's .NET "Engine C"
-#      WMI helpers (UserLoggedin, WinOSVersion, VolumeFrag, PrintQueue, ADSRepl, …)
-#      can do REMOTE WMI through the same facade+sidecar. The facade was also extended
-#      to synthesize WMI system properties (__GENUS/__CLASS/__SERVER/__NAMESPACE/__PATH)
-#      and the sink-based async query path .NET's System.Management uses by default.
-#      Regenerate with wmi-bridge/facade/patch-system-management/. See docker/DOTNET-ENGINE-C.md.
-COPY --chown=prtg:prtg wmi-bridge/facade/System.Management.patched.dll \
-     "/home/prtg/.wine/drive_c/windows/mono/mono-2.0/lib/mono/gac/System.Management/4.0.0.0__b03f5f7f11d50a3a/System.Management.dll"
+#  (3) System.Management.dll — Wine-Mono's open-source System.Management (installed in
+#      4b). Stock Mono throws NotImplementedException whenever explicit credentials are
+#      passed to a WMI query (WmiNetUtilsHelper.AuthNotSup); a Mono.Cecil rewrite empties
+#      that guard so the probe's .NET "Engine C" WMI helpers (UserLoggedin, WinOSVersion,
+#      VolumeFrag, PrintQueue, ADSRepl, …) can do REMOTE WMI through the same facade+
+#      sidecar. The facade was also extended to synthesize WMI system properties
+#      (__GENUS/__CLASS/__SERVER/__NAMESPACE/__PATH) and the sink-based async query path
+#      .NET's System.Management uses by default.
+#      This patch is now applied IN-IMAGE (it rewrites this image's OWN Wine-Mono GAC
+#      DLL), so there is nothing to COPY here — see step 5d-bis (scripts/build-class-b.sh)
+#      and wmi-bridge/facade/patch-system-management/. See docker/DOTNET-ENGINE-C.md.
 
 # ---- 5d. PowerShell (PSRP) bridge + Windows-Update helper -------------------
 #  Let the .NET "Engine C" helpers that are PSRP clients (run cmdlets on a remote
@@ -347,6 +347,7 @@ COPY --chown=prtg:prtg wmi-bridge/facade/System.Management.patched.dll \
 #  (1) System.Management.Automation.dll — Mono SMA shim. Mono binds it to the
 #      helpers' standard SMA assembly identity; Pipeline.Invoke POSTs to the sidecar /psrp.
 #      Drives ExchangeSensorPS and LastWindowsUpdateSensor (live, 16 channels).
+#      Built IN-IMAGE in step 5d-bis (not COPYd) — see scripts/build-class-b.sh.
 #  (2) Paessler.Config.dll — shipped VENDOR-ORIGINAL (unmodified, never touched).
 #      NOTE: the SCVMM sensor (SCVMMSensor.exe) is UNSUPPORTED. It references
 #      a constructor overload this build's bundled config library does not expose.
@@ -359,6 +360,7 @@ COPY --chown=prtg:prtg wmi-bridge/facade/System.Management.patched.dll \
 #      sensor affected; Exchange and Windows Update are unaffected.
 #  (3) Interop.WUApiLib.dll — shim for the legacy LastWinUpdateXML.exe WUApiLib COM
 #      surface; UpdateSearcher.Search() -> sidecar /wua (WUA via a SYSTEM scheduled task).
+#      Built IN-IMAGE in step 5d-bis (not COPYd) — see scripts/build-class-b.sh.
 #  (4) LastWinUpdateXML.exe — shipped VENDOR-ORIGINAL. The legacy EXE would hang in a WinForms
 #      error-dialog message loop under stock Wine because its headless check
 #      (try{Console.CursorVisible}catch{headless=true}) never throws under Mono. That is fixed
@@ -367,9 +369,9 @@ COPY --chown=prtg:prtg wmi-bridge/facade/System.Management.patched.dll \
 #      path) + the WUApiLib shim (counts bridged via prtg_host) + the wrapper's date injection.
 #      (The modern PowerShell LastWindowsUpdateSensor remains the preferred WU sensor; this
 #      makes the legacy one work, vendor-original, too.)
-ARG SS="/home/prtg/.wine/drive_c/Program Files (x86)/PRTG Network Monitor/Sensor System"
-COPY --chown=prtg:prtg powershell-bridge/System.Management.Automation.dll "${SS}/System.Management.Automation.dll"
-COPY --chown=prtg:prtg powershell-bridge/Interop.WUApiLib.dll             "${SS}/Interop.WUApiLib.dll"
+#  System.Management.Automation.dll and Interop.WUApiLib.dll are built IN-IMAGE in step
+#  5d-bis below (they are compiled from source with this image's own Wine-Mono mcs), so
+#  they are no longer COPYd from the build context.
 #  Paessler.Config.dll is intentionally NOT overwritten and NOT augmented — the installer's
 #  VENDOR-ORIGINAL binary is what runs (see note (2): the SCVMM-only ctor skew is a vendor
 #  packaging defect that also fails on genuine Windows, so we match the product).
@@ -408,6 +410,32 @@ USER root
 COPY powershell-bridge/lastwinupdate-wrapper.sh /usr/local/bin/lastwinupdate-wrapper.sh
 RUN chmod +x /usr/local/bin/lastwinupdate-wrapper.sh
 USER prtg
+
+# ---- 5d-bis. build the Class B compatibility artifacts IN-IMAGE ------------
+#  The three "Class B" artifacts are derived from THIS image's own Wine-Mono runtime,
+#  so they cannot exist on a fresh clone (the runtime that produces them does not exist
+#  until the image is built). Rather than COPY prebuilt DLLs from the host — which
+#  created a chicken-and-egg for a first build — we compile them here, in place, from
+#  the committed C# sources, using the Wine-Mono `mcs` installed in step 4b:
+#    1. System.Management.Automation.dll  (SMA shim)      -> Sensor System/
+#    2. Interop.WUApiLib.dll              (WUApiLib shim) -> Sensor System/
+#    3. System.Management.dll (Wine-Mono GAC) patched in place via Mono.Cecil
+#  Must run AFTER 4b (Wine-Mono), step 5 (installer -> "Sensor System/"), and the
+#  Mono.Cecil.dll COPY above. See scripts/build-class-b.sh and docker/ENGINE-C-POWERSHELL.md.
+COPY --chown=prtg:prtg powershell-bridge/sma-shim.cs   /tmp/class-b-src/sma-shim.cs
+COPY --chown=prtg:prtg powershell-bridge/wuapi-shim.cs /tmp/class-b-src/wuapi-shim.cs
+COPY --chown=prtg:prtg wmi-bridge/facade/patch-system-management/Program.cs /tmp/class-b-src/patch-system-management.cs
+USER root
+COPY scripts/build-class-b.sh /usr/local/bin/build-class-b.sh
+RUN chmod +x /usr/local/bin/build-class-b.sh
+USER prtg
+RUN set -eux; \
+    mkdir -p /tmp/xdg; chmod 700 /tmp/xdg; export XDG_RUNTIME_DIR=/tmp/xdg; \
+    Xvfb :0 -screen 0 1024x768x16 >/tmp/xvfb-classb.log 2>&1 & \
+    sleep 2; \
+    CLASSB_SRC=/tmp/class-b-src /usr/local/bin/build-class-b.sh; \
+    timeout 20 wineserver -w || wineserver -k || true; \
+    rm -rf /tmp/class-b-src
 
 # ---- 5e. custom-sensor support ---------------------------------------------
 #  Installs PowerShell Core 7.6.2 (pwsh) for the PowerShell-Script bridge and
