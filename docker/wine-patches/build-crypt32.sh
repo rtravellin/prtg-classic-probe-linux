@@ -24,9 +24,9 @@ SUDO=""; docker info >/dev/null 2>&1 || SUDO="sudo"
 $SUDO docker run --rm -v "$DIR":/patch -w /work debian:12 bash -euo pipefail -c "
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq gcc-mingw-w64-i686 make gcc flex bison xz-utils wget >/dev/null
+  apt-get install -y -qq gcc-mingw-w64-i686 make gcc flex bison xz-utils wget python3 patch >/dev/null
   cd /work
-  wget -q https://dl.winehq.org/wine/source/${WINE_VER%.*}.x/wine-${WINE_VER}.tar.xz
+  wget -q https://dl.winehq.org/wine/source/${WINE_VER}/wine-${WINE_VER}.tar.xz
   tar xf wine-${WINE_VER}.tar.xz
   cd wine-${WINE_VER}
   # apply the verify-order fix (idempotent, version-guarded)

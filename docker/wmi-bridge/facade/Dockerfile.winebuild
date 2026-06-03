@@ -4,7 +4,7 @@
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential flex bison perl pkg-config \
-        wget xz-utils ca-certificates python3 \
+        wget xz-utils ca-certificates python3 file \
         gcc-mingw-w64-i686 g++-mingw-w64-i686 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
