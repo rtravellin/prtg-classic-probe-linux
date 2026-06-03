@@ -59,14 +59,14 @@ require_docker() {
 # ---- A1. crypt32.dll --------------------------------------------------------
 build_crypt32() {
     step "crypt32.dll — Wine ${WINE_VER} Authenticode SignedAttrs fix"
-    ( cd "$DIR/wine-patches" && WINE_VER="$WINE_VER" ./build-crypt32.sh )
+    ( cd "$DIR/wine-patches" && WINE_VER="$WINE_VER" bash ./build-crypt32.sh )
     [ -f "$DIR/wine-patches/crypt32.dll" ] && built+=("wine-patches/crypt32.dll")
 }
 
 # ---- A1b. kernelbase.dll ----------------------------------------------------
 build_kernelbase() {
     step "kernelbase.dll — Wine ${WINE_VER} ImpersonateLoggedOnUser(NULL) revert-to-self fix"
-    ( cd "$DIR/wine-patches" && WINE_VER="$WINE_VER" ./build-kernelbase.sh )
+    ( cd "$DIR/wine-patches" && WINE_VER="$WINE_VER" bash ./build-kernelbase.sh )
     [ -f "$DIR/wine-patches/kernelbase.dll" ] && built+=("wine-patches/kernelbase.dll")
 }
 
@@ -83,7 +83,7 @@ build_patch_mono_console() {
 # ---- A2. wbemfacade.dll -----------------------------------------------------
 build_wbemfacade() {
     step "wbemfacade.dll — MinGW C (CLSID_WbemLocator -> Impacket sidecar)"
-    ( cd "$DIR/wmi-bridge/facade" && ./build.sh )
+    ( cd "$DIR/wmi-bridge/facade" && bash ./build.sh )
     [ -f "$DIR/wmi-bridge/facade/wbemfacade.dll" ] && built+=("wmi-bridge/facade/wbemfacade.dll")
 }
 
@@ -100,7 +100,7 @@ build_wbemdisp() {
 # ---- A4. PRTGProbeUpdate.shim.exe -------------------------------------------
 build_update_shim() {
     step "PRTGProbeUpdate.shim.exe — MinGW C (update interception stub)"
-    ( cd "$DIR/scripts/update-shim" && ./build-shim.sh ${LOCAL:+--local} )
+    ( cd "$DIR/scripts/update-shim" && bash ./build-shim.sh ${LOCAL:+--local} )
     [ -f "$DIR/scripts/update-shim/PRTGProbeUpdate.shim.exe" ] \
         && built+=("scripts/update-shim/PRTGProbeUpdate.shim.exe")
 }
